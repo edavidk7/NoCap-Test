@@ -8,9 +8,14 @@ torchrun --standalone --nproc_per_node=1 train_gpt2.py \
   --sequence_length 1024 \
   --val_loss_every 128 \
   --val_batch_size 16 \
-  --num_iterations 4768 \
+  --num_iterations 6000 \
   --weight_decay 0.1 \
   --learning_rate 0.0018 \
   --warmup_iters 256 \
   --warmdown_iters 1024 \
-  --log_wandb
+  --log_wandb \
+  --ff_kind glu \
+  --seed 42 \
+  --mlp_drop_n 2 \
+  --mlp_alpha 6.0 \
+  --mlp_act silu \
