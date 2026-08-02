@@ -78,7 +78,6 @@ class CausalSelfAttention(nn.Module):
         if self.learn_temperature:
             self.log_temperature = nn.Parameter(torch.zeros(self.n_head))  # default temperature to 1.0
         self.log_temperature_scale = config.temperature_scale
-        self.gqa = config.gqa
         self.temperature_ones = torch.ones(2 * self.n_embd)
         if self.head_gate:
             self.gate_proj = nn.Linear(self.n_embd, self.n_head)
@@ -107,7 +106,7 @@ class CausalSelfAttention(nn.Module):
 
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True, enable_gqa=self.gqa)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2)  # (B, T, n_head, head_dim)
         if self.head_gate:
             gate = torch.sigmoid(self.gate_proj(x)).view(B, T, self.n_head, 1)
@@ -170,42 +169,22 @@ class MLP(nn.Module):
         return x
 
 
-class MultiTokenPredictionHead(nn.Module):
-    def __init__(self, config, offsets):
-        super().__init__()
-        self.offsets = tuple(offsets)
-        self.proj = nn.Linear(config.n_embd, len(self.offsets) * config.n_embd, bias=False)
-        self.n_embd = config.n_embd
-
-    def forward(self, x):
-        B, T, _ = x.size()
-        return self.proj(x).view(B, T, len(self.offsets), self.n_embd)
-
-
 class Block(nn.Module):
     def __init__(self, config, mlp_alpha, no_ffn=False):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.attn_scale = 1 / math.sqrt(2 * config.n_layer)
         self.no_ffn = no_ffn
-        self.mlp_skip = config.mlp_skip
         if not self.no_ffn:
             self.mlp = {"mlp": MLP, "glu": GLUFeedForward}[config.ff_kind](config, mlp_alpha)
-        elif self.mlp_skip:
-            self.mlp_skip_weight = nn.Parameter(torch.ones(config.n_embd))
 
-    def forward(self, x, cos, sin, mlp_skip_features):
+    def forward(self, x, cos, sin):
         x = x + self.attn_scale * self.attn(rmsnorm(x), cos, sin)
         if not self.no_ffn:
-            mlp_out = self.mlp(rmsnorm(x))
-            x = x + mlp_out
-            # carry this block's MLP output forward so later MLP-free blocks can skip-connect to it
-            mlp_skip_features = mlp_out if self.mlp_skip else None
+            x = x + self.mlp(rmsnorm(x))
         else:
-            if self.mlp_skip:
-                x = x + self.mlp_skip_weight * mlp_skip_features
             x = x * (1 + inv_rms(x))
-        return x, mlp_skip_features
+        return x
 
 
 # -----------------------------------------------------------------------------
@@ -224,12 +203,8 @@ class GPTConfig:
     ff_kind: Literal["glu", "mlp"] = "mlp"
     mlp_act: Literal["gelu", "relu", "silu", "relu2"] = "gelu"
     mlp_alpha: float | int | list[float | int] = 4.0  # MLP/GLU hidden-dim multiplier, scalar or per-block list
-    gqa: bool = False
     head_gate: bool = False
     mlp_drop_n: int = 1  # drop every N-1 mlps, keeping the first one.
-    mlp_skip: bool = False  # skip-connect the last real MLP block's output into the MLP-free blocks that follow it
-    mtp_offsets: tuple[int, ...] = ()  # extra future-token offsets to predict, e.g. (2, 3) for t+2, t+3. Empty disables MTP.
-    mtp_lambdas: tuple[float, ...] = ()  # per-offset loss weights matching mtp_offsets order; empty defaults to equal weights summing to 1.
 
 
 class GPT(nn.Module):
@@ -261,23 +236,6 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
 
-        if config.mtp_offsets:
-            seen = set()
-            self.mtp_offsets = tuple(k for k in config.mtp_offsets if not (k in seen or seen.add(k)))  # dedup, preserve order
-        else:
-            self.mtp_offsets = ()
-        if self.mtp_offsets:
-            assert all(k >= 2 for k in self.mtp_offsets), "mtp_offsets must be >= 2 (t+1 is already covered by the standard head)"
-            self.mtp_head = MultiTokenPredictionHead(config, self.mtp_offsets)
-            if config.mtp_lambdas:
-                assert len(config.mtp_lambdas) == len(self.mtp_offsets), (
-                    f"mtp_lambdas length ({len(config.mtp_lambdas)}) must match mtp_offsets length ({len(self.mtp_offsets)}); "
-                    f"order follows --mtp, e.g. --mtp 2 3 --mtp_lambdas 0.5 0.25"
-                )
-                self.mtp_lambdas = tuple(config.mtp_lambdas)
-            else:
-                self.mtp_lambdas = tuple(1.0 / len(self.mtp_offsets) for _ in self.mtp_offsets)
-
     def forward(self, idx, targets=None, return_logits=True):
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device)  # shape (t)
@@ -286,40 +244,24 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         cos, sin = self.rotary(x)
 
-        mlp_skip_features = None
         for block in self.transformer.h:
-            x, mlp_skip_features = block(x, cos, sin, mlp_skip_features)
+            x = block(x, cos, sin)
         x = rmsnorm(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            ntp_loss = loss
-
-            if self.mtp_offsets:
-                # targets[:, k-1:] holds the token at position t+k for hidden state x[:, t]
-                # (targets is already the t+1 shift of idx, so k=1 recovers the standard head above).
-                mtp_hidden = self.mtp_head(x)  # (b, t, n_offsets, n_embd)
-                mtp_loss = 0.0
-                for i, k in enumerate(self.mtp_offsets):
-                    valid_len = t - (k - 1)
-                    h_k = rmsnorm(mtp_hidden[:, :valid_len, i, :])
-                    logits_k = self.lm_head(h_k)  # computed and consumed one offset at a time to cap peak memory
-                    targets_k = targets[:, k - 1 :]
-                    mtp_loss = mtp_loss + self.mtp_lambdas[i] * F.cross_entropy(logits_k.reshape(-1, logits_k.size(-1)), targets_k.reshape(-1), ignore_index=-1)
-                loss = loss + mtp_loss
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
             loss = None
-            ntp_loss = None
 
         # there are performance reasons why not returning logits is prudent, if not needed
         if not return_logits:
             logits = None
 
-        return logits, loss, ntp_loss
+        return logits, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, temperature_lr_mult=1.0):
         temperature_params = [p for n, p in self.named_parameters() if n.endswith("log_temperature")]
@@ -530,29 +472,6 @@ if __name__ == "__main__":
         help="MLP/GLU hidden-dim multiplier: single value, or a list of values matching the number of blocks",
     )
     parser.add_argument("--mlp_drop_n", type=int, default=1, help="share MLP weights every N consecutive blocks (n_layer must be divisible by N)")
-    parser.add_argument(
-        "--mlp_skip",
-        action="store_true",
-        default=False,
-        help="skip-connect the last real MLP block's output (scaled by a learned multiplicative weight) into the "
-        "output of every MLP-free block that follows it (only relevant when --mlp_drop_n > 1)",
-    )
-    parser.add_argument(
-        "--mtp",
-        type=int,
-        nargs="*",
-        default=[],
-        help="extra future-token offsets to predict via a fused multi-token-prediction head, e.g. --mtp 2 3 additionally "
-        "predicts t+2 and t+3 alongside the standard t+1 objective. Disabled by default (no flag / empty list).",
-    )
-    parser.add_argument(
-        "--mtp_lambdas",
-        type=float,
-        nargs="*",
-        default=[],
-        help="per-offset loss weights matching --mtp order, e.g. --mtp 2 3 --mtp_lambdas 0.5 0.25. If omitted, defaults to equal weights 1/len(mtp) for each offset.",
-    )
-    parser.add_argument("--gqa", action="store_true", default=False, help="enable group-query attention")
     parser.add_argument("--head_gate", action="store_true", default=False, help="enable learned per-head output gating in attention")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
     # evaluation
@@ -674,12 +593,8 @@ if __name__ == "__main__":
             ff_kind=args.ff_kind,
             mlp_act=args.mlp_act,
             mlp_alpha=mlp_alpha,
-            gqa=args.gqa,
             head_gate=args.head_gate,
             mlp_drop_n=args.mlp_drop_n,
-            mlp_skip=args.mlp_skip,
-            mtp_offsets=tuple(args.mtp),
-            mtp_lambdas=tuple(args.mtp_lambdas),
         ),  # 124M GPT-2
         "d24": GPTConfig(
             vocab_size=num_vocab,
@@ -691,12 +606,8 @@ if __name__ == "__main__":
             ff_kind=args.ff_kind,
             mlp_act=args.mlp_act,
             mlp_alpha=mlp_alpha,
-            gqa=args.gqa,
             head_gate=args.head_gate,
             mlp_drop_n=args.mlp_drop_n,
-            mlp_skip=args.mlp_skip,
-            mtp_offsets=tuple(args.mtp),
-            mtp_lambdas=tuple(args.mtp_lambdas),
         ),
         "d36": GPTConfig(
             vocab_size=num_vocab,
@@ -708,12 +619,8 @@ if __name__ == "__main__":
             ff_kind=args.ff_kind,
             mlp_act=args.mlp_act,
             mlp_alpha=mlp_alpha,
-            gqa=args.gqa,
             head_gate=args.head_gate,
             mlp_drop_n=args.mlp_drop_n,
-            mlp_skip=args.mlp_skip,
-            mtp_offsets=tuple(args.mtp),
-            mtp_lambdas=tuple(args.mtp_lambdas),
         ),
         "d48": GPTConfig(
             vocab_size=num_vocab,
@@ -725,12 +632,8 @@ if __name__ == "__main__":
             ff_kind=args.ff_kind,
             mlp_act=args.mlp_act,
             mlp_alpha=mlp_alpha,
-            gqa=args.gqa,
             head_gate=args.head_gate,
             mlp_drop_n=args.mlp_drop_n,
-            mlp_skip=args.mlp_skip,
-            mtp_offsets=tuple(args.mtp),
-            mtp_lambdas=tuple(args.mtp_lambdas),
         ),
         "d36": GPTConfig(
             vocab_size=num_vocab,
@@ -742,12 +645,8 @@ if __name__ == "__main__":
             ff_kind=args.ff_kind,
             mlp_act=args.mlp_act,
             mlp_alpha=mlp_alpha,
-            gqa=args.gqa,
             head_gate=args.head_gate,
             mlp_drop_n=args.mlp_drop_n,
-            mlp_skip=args.mlp_skip,
-            mtp_offsets=tuple(args.mtp),
-            mtp_lambdas=tuple(args.mtp_lambdas),
         ),
         "d48": GPTConfig(
             vocab_size=num_vocab,
@@ -759,12 +658,8 @@ if __name__ == "__main__":
             ff_kind=args.ff_kind,
             mlp_act=args.mlp_act,
             mlp_alpha=mlp_alpha,
-            gqa=args.gqa,
             head_gate=args.head_gate,
             mlp_drop_n=args.mlp_drop_n,
-            mlp_skip=args.mlp_skip,
-            mtp_offsets=tuple(args.mtp),
-            mtp_lambdas=tuple(args.mtp_lambdas),
         ),
     }[args.model]
     model = GPT(model_config)
@@ -838,8 +733,8 @@ if __name__ == "__main__":
                 val_loss = 0.0
                 for _ in range(val_steps):  # always fiexed number of validation steps
                     x_val, y_val = val_loader.next_batch()
-                    _, _, ntp_loss = model(x_val, y_val, return_logits=False)
-                    val_loss += ntp_loss
+                    _, loss = model(x_val, y_val, return_logits=False)
+                    val_loss += loss
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 val_loss /= val_steps
             # log to console and to file
@@ -880,7 +775,7 @@ if __name__ == "__main__":
             model.require_backward_grad_sync = micro_step == args.grad_accumulation_steps - 1  # sync only on last micro step to avoid overhead
             # forward pass
             with ctx:
-                _, loss, _ = model(x, y, return_logits=False)
+                _, loss = model(x, y, return_logits=False)
                 loss = loss / args.grad_accumulation_steps  # scale loss for gradient accumulation
                 train_loss += loss.detach()
             # advance the dataset for the next batch
