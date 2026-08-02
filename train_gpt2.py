@@ -3,6 +3,8 @@ import sys
 import uuid
 import math
 import glob
+import queue
+import threading
 from dataclasses import dataclass
 
 import numpy as np
@@ -11,8 +13,11 @@ from torch import nn
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch._inductor.config as config
+import torch._dynamo
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+
+torch.set_float32_matmul_precision('high')
 
 with open(sys.argv[0]) as f:
     code = f.read()
@@ -153,9 +158,6 @@ class GPT(nn.Module):
         )  # https://paperswithcode.com/method/weight-tying
 
     def forward(self, idx, targets=None, return_logits=True):
-        b, t = idx.size()
-        pos = torch.arange(0, t, dtype=torch.long, device=idx.device)  # shape (t)
-
         # forward the GPT model itself
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
 
@@ -183,8 +185,14 @@ class GPT(nn.Module):
         return logits, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # fused AdamW is a single CUDA kernel per step instead of one per tensor
+        use_fused = device_type.startswith("cuda")
         optimizer = torch.optim.AdamW(
-            self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas
+            self.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            betas=betas,
+            fused=use_fused,
         )
         return optimizer
 
@@ -223,10 +231,14 @@ def _load_data_shard(filename):
         # the rest of it are tokens, stored as uint16
         tokens = np.frombuffer(f.read(), dtype=np.uint16)
     assert len(tokens) == ntok, "number of tokens read does not match header?"
-    return tokens
+    # cast the whole shard to the dtype the model expects once here, so that
+    # next_batch() only has to slice/view (no re-casting per batch)
+    return torch.from_numpy(tokens.astype(np.int64))
 
 
 class DistributedDataLoader:
+    PREFETCH_BATCHES = 8
+
     def __init__(self, filename_pattern, B, T, process_rank, num_processes):
         self.process_rank = process_rank
         self.num_processes = num_processes
@@ -250,37 +262,104 @@ class DistributedDataLoader:
             f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files"
         )
 
+        # guards T / current_position / current_shard / tokens, which the prefetch
+        # thread reads while the training loop may be changing the sequence length
+        self._lock = threading.Lock()
+
         # kick things off
         self.reset()
 
     def reset(self):
-        self.current_shard = 0
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+        self._stop_prefetch()  # no worker is running past this point
+        with self._lock:
+            self.current_shard = 0
+            self.current_position = self.process_rank * self.B * self.T
+            self.tokens = _load_data_shard(self.files[self.current_shard])
+        self._start_prefetch()
+
+    def set_shape(self, B, T):
+        """Change the batch shape without restarting the prefetch thread.
+
+        Batches already queued at the old shape are tagged and dropped by
+        next_batch(). The read position is realigned so that a larger slice
+        still fits inside the current shard.
+        """
+        with self._lock:
+            if (B, T) == (self.B, self.T):
+                return
+            self.B = B
+            self.T = T
+            self.current_position = self.process_rank * B * T
 
     def advance(self):  # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
+    def _make_batch(self):
+        # advance() is called with the lock held, so it must not take it itself
+        with self._lock:
+            B = self.B
+            T = self.T
+            buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+            x = (buf[:-1]).view(B, T)  # inputs
+            y = (buf[1:]).view(B, T)  # targets
+            # advance current position and load next shard if necessary
+            self.current_position += B * T * self.num_processes
+            if self.current_position + (B * T * self.num_processes + 1) > len(
+                self.tokens
+            ):
+                self.advance()
+        # pin here (in the background thread) so the later .cuda(non_blocking=True)
+        # transfer in next_batch() is actually asynchronous. x and y are views onto
+        # a shard the worker may since have replaced, but pin_memory() copies.
+        return (B, T), x.pin_memory(), y.pin_memory()
+
+    def _prefetch_worker(self):
+        while not self._stop_event.is_set():
+            batch = self._make_batch()
+            while not self._stop_event.is_set():
+                try:
+                    self._queue.put(batch, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    def _start_prefetch(self):
+        self._queue = queue.Queue(maxsize=self.PREFETCH_BATCHES)
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._prefetch_worker, daemon=True)
+        self._thread.start()
+
+    def _stop_prefetch(self):
+        if getattr(self, "_thread", None) is None:
+            return
+        self._stop_event.set()
+        # drain the queue in case the worker is blocked on a full put()
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._thread.join()
+        self._thread = None
+
     def next_batch(self):
-        B = self.B
-        T = self.T
-        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, T)  # inputs
-        y = (buf[1:]).view(B, T)  # targets
-        # advance current position and load next shard if necessary
-        self.current_position += B * T * self.num_processes
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.advance()
-        return x.cuda(), y.cuda()
+        # only the training loop calls this and set_shape(), so self.B/self.T are a
+        # consistent read here: skip whatever the worker built at the old shape
+        while True:
+            shape, x, y = self._queue.get()
+            if shape == (self.B, self.T):
+                return x.cuda(non_blocking=True), y.cuda(non_blocking=True)
 
 
 # -----------------------------------------------------------------------------
 # int main
 
 VAL_TOKENS = 1_048_576  # how many tokens of validation data. It's important to keep this fixed for consistent comparisons
+# validation never runs longer than this, whatever the training curriculum does:
+# it is the length the run is scored at, so it has to stay comparable
+VAL_SEQ_LEN_MAX = 1024
 
 
 def print0(*args, **kwargs):
@@ -288,6 +367,30 @@ def print0(*args, **kwargs):
     # if this is not a distributed run, it's just a print
     if int(os.environ.get("RANK", 0)) == 0:
         print(*args, **kwargs)
+
+
+def parse_seq_len_schedule(spec, max_seq_len):
+    """"0:256,0.3:512,0.6:1024" -> [(0.0, 256), (0.3, 512), (0.6, 1024)].
+
+    Fractions are of num_iterations. An empty spec means a constant max_seq_len.
+    """
+    if not spec:
+        return [(0.0, max_seq_len)]
+    stages = sorted(
+        (float(frac), int(length))
+        for frac, length in (entry.split(":") for entry in spec.split(","))
+    )
+    assert stages[0][0] == 0.0, "schedule must start at fraction 0"
+    for _, length in stages:
+        assert 0 < length <= max_seq_len, f"stage length {length} exceeds sequence_length"
+        assert max_seq_len % length == 0, f"stage length {length} must divide sequence_length"
+    return stages
+
+
+def seq_len_at(stages, progress):
+    """Sequence length for a given fraction of training completed."""
+    # stages is sorted and starts at 0.0, so this always matches
+    return next(length for frac, length in reversed(stages) if progress >= frac)
 
 
 if __name__ == "__main__":
@@ -338,6 +441,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sequence_length", type=int, default=64, help="sequence length"
     )
+    parser.add_argument(
+        "--seq_len_schedule",
+        type=str,
+        default="",
+        help="context-length curriculum as 'frac:len,frac:len,...', fractions of "
+        "num_iterations, e.g. '0:256,0.3:512,0.6:1024'. Lengths must divide "
+        "--sequence_length, which is the final (largest) length. Empty means a "
+        "constant --sequence_length. Tokens per iteration are held fixed by "
+        "scaling batch_size inversely with the current length.",
+    )
     # workload (number of steps)
     parser.add_argument(
         "--num_iterations", type=int, default=10, help="number of iterations to run"
@@ -386,7 +499,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # args error checking and convenience variables
+    # T is the largest (final) sequence length; the curriculum ramps up to it
     B, T = args.batch_size, args.sequence_length
+    seq_len_stages = parse_seq_len_schedule(args.seq_len_schedule, T)
+    print0(f"Using sequence length stages {seq_len_stages}")
     assert args.model in {"d12", "d24", "d36", "d48"}
     # set up DDP (distributed data parallel). torchrun sets this env variable
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
@@ -417,23 +533,51 @@ if __name__ == "__main__":
         wandb.save("train_gpt2.py")
         wandb.save("run.sh")
 
-    tokens_per_iter = B * T * ddp_world_size * args.grad_accumulation_steps
-    print0(f"tokens per iteration: {tokens_per_iter:,}")
+    # the batch is fixed, so an iteration is worth fewer tokens at a shorter length
+    def tokens_per_iter_at(seq_len):
+        return B * seq_len * ddp_world_size * args.grad_accumulation_steps
+
+    planned_tokens = sum(
+        tokens_per_iter_at(seq_len_at(seq_len_stages, s / args.num_iterations))
+        for s in range(args.num_iterations)
+    )
+    print0(f"total tokens over the run: {planned_tokens:,}")
 
     # set up a context manager following the desired dtype and device
     ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-    # load tokens
+    # load tokens. the train loader is built at the largest length so that the
+    # shard size checks cover the biggest slice we will ever ask for, then dropped
+    # to the first stage of the curriculum.
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-    val_loader = None
-    tokens_per_iter_val = args.val_batch_size * T * ddp_world_size
-    assert VAL_TOKENS % tokens_per_iter_val == 0
-    val_steps = VAL_TOKENS // tokens_per_iter_val
+    curr_seq_len = seq_len_at(seq_len_stages, 0.0)
+    train_loader.set_shape(B, curr_seq_len)
+    x, y = train_loader.next_batch()
+    # the loop below only logs on a *change*, so announce the opening stage here
+    print0(
+        f"step:0/{args.num_iterations} | seq len -> {curr_seq_len}"
+        f" | tokens/iter {tokens_per_iter_at(curr_seq_len):,}"
+    )
+
+    # validation follows the curriculum but never past VAL_SEQ_LEN_MAX, so the score
+    # stays comparable once training runs longer than the scored length. the batch is
+    # fixed here too, so the *step count* varies inversely with the length and every
+    # validation still covers exactly VAL_TOKENS tokens.
+    val_T = min(T, VAL_SEQ_LEN_MAX)
+
+    def val_steps_for(seq_len):
+        tokens_per_iter_val = args.val_batch_size * seq_len * ddp_world_size
+        assert VAL_TOKENS % tokens_per_iter_val == 0
+        return VAL_TOKENS // tokens_per_iter_val
+
+    # fail at startup rather than mid-run if any stage cannot hit VAL_TOKENS exactly
+    for _, stage_len in seq_len_stages:
+        val_steps_for(min(stage_len, VAL_SEQ_LEN_MAX))
 
     val_loader = DistributedDataLoader(
-        args.input_val_bin, args.val_batch_size, T, ddp_rank, ddp_world_size
+        args.input_val_bin, args.val_batch_size, val_T, ddp_rank, ddp_world_size
     )
-    x, y = train_loader.next_batch()
+    val_loader.set_shape(args.val_batch_size, min(curr_seq_len, VAL_SEQ_LEN_MAX))
 
     # init the model from scratch
     num_vocab = 50257
@@ -449,13 +593,17 @@ if __name__ == "__main__":
     model = model.train().cuda()
     if hasattr(config, "coordinate_descent_tuning"):
         config.coordinate_descent_tuning = True  # suggested by @Chillee
+    if ddp_world_size == 1:
+        torch._dynamo.config.optimize_ddp = False
     print0("compiling the model...")
     model = torch.compile(
-        model
+        model, dynamic=False
     )  # NOTE: this might cause issues depending on your GPU, consider turning it off
 
     # here we wrap model into DDP container
-    model = DDP(model, device_ids=[ddp_local_rank])
+    # broadcast_buffers=False: the only buffer (Rotary.inv_freq) is static and
+    # identical across ranks by construction, so there's nothing to re-sync
+    model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=False)
     raw_model = model.module  # always contains the "raw" unwrapped model
 
     # init the optimizer
@@ -492,6 +640,7 @@ if __name__ == "__main__":
             pass
 
     training_time_ms = 0.0
+    total_tokens = 0  # actually consumed so far, which the schedule makes non-linear
     # start the clock
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -500,6 +649,19 @@ if __name__ == "__main__":
     for step in range(args.num_iterations + 1):
         last_step = step == args.num_iterations
 
+        # context-length curriculum. the batch is fixed, so a shorter length means a
+        # cheaper iteration carrying proportionally fewer tokens rather than the same
+        # tokens rearranged.
+        curr_seq_len = seq_len_at(seq_len_stages, step / args.num_iterations)
+        if curr_seq_len != train_loader.T:
+            train_loader.set_shape(B, curr_seq_len)
+            val_loader.set_shape(args.val_batch_size, min(curr_seq_len, VAL_SEQ_LEN_MAX))
+            x, y = train_loader.next_batch()  # drop the batch built at the old shape
+            print0(
+                f"step:{step}/{args.num_iterations} | seq len -> {curr_seq_len}"
+                f" | tokens/iter {tokens_per_iter_at(curr_seq_len):,}"
+            )
+
         # once in a while evaluate the validation dataset
         if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step):
             # stop the clock
@@ -507,9 +669,11 @@ if __name__ == "__main__":
             training_time_ms += 1000 * (time.perf_counter() - t0)
             model.eval()
             val_loader.reset()  # reset the val loader so that it starts from the beginning
+            # varies with the length so that every validation still sees VAL_TOKENS
+            val_steps = val_steps_for(val_loader.T)
             with torch.no_grad():
                 val_loss = 0.0
-                for _ in range(val_steps):  # always fiexed number of validation steps
+                for _ in range(val_steps):
                     x_val, y_val = val_loader.next_batch()
                     _, loss = model(x_val, y_val, return_logits=False)
                     val_loss += loss
@@ -519,8 +683,8 @@ if __name__ == "__main__":
             print0(f"step:{step}/{args.num_iterations} | val loss {val_loss:.6f}")
             if master_process:
                 if args.log_wandb:
-                    wandb.log({"val_loss": val_loss}, step=step * tokens_per_iter)
-                    wandb.log({"time": training_time_ms}, step=step * tokens_per_iter)
+                    wandb.log({"val_loss": val_loss}, step=total_tokens)
+                    wandb.log({"time": training_time_ms}, step=total_tokens)
                 if logfile is not None:
                     with open(logfile, "a") as f:
                         f.write("s:%d val:%f\n" % (step, val_loss))
@@ -562,16 +726,19 @@ if __name__ == "__main__":
         # step the optimizer
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        total_tokens += tokens_per_iter_at(curr_seq_len)
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
 
-        torch.cuda.synchronize()
         # time and print
-        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+        # no separate torch.cuda.synchronize() here: train_loss.item() below
+        # already blocks until this step's GPU work (and the all_reduce) is
+        # done, so a dedicated sync first would just be a redundant device drain
         # the 0th iteration is often an outlier (much slower) => skip logging it
         # tokens_per_second = ddp_world_size * B * T / (t1-t0)
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
         lossf = train_loss.item()  # keep track of the mean loss
+        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
         print0(
             f"step:{step}/{args.num_iterations} | loss {lossf:.6f} | train_time:{approx_training_time_ms/1000:.2f}s | step_avg:{approx_training_time_ms/(step+1):.2f}ms"
         )
@@ -598,4 +765,8 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------------
     # clean up nice
+    # join the prefetch workers first: a daemon thread still inside pin_memory()
+    # when the interpreter tears down aborts the process (SIGABRT) on exit
+    train_loader._stop_prefetch()
+    val_loader._stop_prefetch()
     destroy_process_group()
