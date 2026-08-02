@@ -1,10 +1,12 @@
-torchrun --standalone --nproc_per_node=1 train_gpt2.py \
+GRAD_ACCUM_SCHEDULE="0:2,0.05:4,0.1:8,0.2:16,0.35:32"
+
+uv run torchrun --standalone --nproc_per_node=1 train_gpt2.py \
   --input_bin "data/fineweb10B/fineweb_train_*.bin" \
   --input_val_bin "data/fineweb10B/fineweb_val_*.bin" \
   --output_dir pylog124M \
   --model d12 \
   --batch_size 16 \
-  --grad_accumulation_steps 32 \
+  --grad_accum_schedule "$GRAD_ACCUM_SCHEDULE" \
   --sequence_length 1024 \
   --val_loss_every 128 \
   --val_batch_size 16 \

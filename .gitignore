@@ -2,4 +2,4 @@ data/fineweb10B/
 pylog124M/
 logs/
 wandb/
-__pycache__
+__pycache__*
