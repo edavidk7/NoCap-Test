@@ -188,7 +188,7 @@ class Block(nn.Module):
         if not self.no_ffn:
             x = x + self.mlp(rmsnorm(x))
         else:
-            x = x * (1 + inv_rms(x))
+            x = x + rmsnorm(x)
         return x
 
 
@@ -562,26 +562,6 @@ if __name__ == "__main__":
         help="how many batches of val to average?",
     )
     parser.add_argument(
-        "--extend_training",
-        action="store_true",
-        default=False,
-        help="if val loss hasn't reached --target_val_loss by --num_iterations, keep training past it (up to "
-        "--max_iterations) instead of stopping; also stops as soon as the target is reached, even before "
-        "--num_iterations. Requires --target_val_loss and --max_iterations.",
-    )
-    parser.add_argument(
-        "--target_val_loss",
-        type=float,
-        default=3.3821,
-        help="convergence target for validation loss, used by --extend_training",
-    )
-    parser.add_argument(
-        "--max_iterations",
-        type=int,
-        default=None,
-        help="hard cap on iterations when --extend_training is set; the run always stops here regardless of convergence",
-    )
-    parser.add_argument(
         "--save_every",
         type=int,
         default=5000,
@@ -607,10 +587,6 @@ if __name__ == "__main__":
     # the sequence length is constant now: the curriculum acts on the effective batch
     B, T = args.batch_size, args.sequence_length
     assert args.model in {"d12", "d24", "d36", "d48"}
-    if args.extend_training:
-        assert args.target_val_loss is not None and args.max_iterations is not None, "--extend_training requires both --target_val_loss and --max_iterations to be set"
-        assert args.max_iterations >= args.num_iterations, "--max_iterations must be >= --num_iterations"
-        assert args.val_loss_every > 0, "--extend_training requires --val_loss_every > 0 to check convergence"
     # set up DDP (distributed data parallel). torchrun sets this env variable
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
@@ -618,10 +594,6 @@ if __name__ == "__main__":
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
     ddp_world_size = int(os.environ["WORLD_SIZE"])
-    # when --extend_training is set, the warmdown is stretched out over --max_iterations instead of
-    # --num_iterations, so the lr hasn't already decayed to 0 by the time we might extend past
-    # num_iterations. that is the real length of the run, so schedule fractions are taken over it.
-    lr_horizon = args.max_iterations if args.extend_training else args.num_iterations
     grad_accum_stages = parse_grad_accum_schedule(args.grad_accum_schedule, args.grad_accumulation_steps)
     for _, steps in grad_accum_stages:
         assert steps % ddp_world_size == 0, "every scheduled grad accumulation value must be divisible by world size"
@@ -649,7 +621,7 @@ if __name__ == "__main__":
     def tokens_per_iter_at(grad_accum):
         return B * T * ddp_world_size * grad_accum
 
-    planned_tokens = sum(tokens_per_iter_at(grad_accum_at(grad_accum_stages, s / lr_horizon)) for s in range(lr_horizon))
+    planned_tokens = sum(tokens_per_iter_at(grad_accum_at(grad_accum_stages, s / args.num_iterations)) for s in range(args.num_iterations))
     print0(f"total tokens over the run: {planned_tokens:,}")
 
     mlp_alpha = args.mlp_alpha[0] if len(args.mlp_alpha) == 1 else args.mlp_alpha
@@ -777,16 +749,16 @@ if __name__ == "__main__":
 
     # learning rate decay scheduler (linear warmup and warmdown)
     def get_lr(it):
-        assert it <= lr_horizon
+        assert it <= args.num_iterations
         # 1) linear warmup for warmup_iters steps
         if it < args.warmup_iters:
             return args.learning_rate * (it + 1) / args.warmup_iters
         # 2) constant lr for a while
-        elif it < lr_horizon - args.warmdown_iters:
+        elif it < args.num_iterations - args.warmdown_iters:
             return args.learning_rate
         # 3) linear warmdown
         else:
-            decay_ratio = (lr_horizon - it) / args.warmdown_iters
+            decay_ratio = (args.num_iterations - it) / args.warmdown_iters
             return args.learning_rate * decay_ratio
 
     run_id = str(uuid.uuid4())
@@ -808,20 +780,18 @@ if __name__ == "__main__":
     t0 = time.perf_counter()
 
     # begin training
-    # normally the run spans num_iterations; with --extend_training the hard cap is max_iterations instead,
-    # and we may stop earlier than that (but not before num_iterations) once target_val_loss is reached
-    for step in range(lr_horizon + 1):
-        last_step = step == lr_horizon
+    for step in range(args.num_iterations + 1):
+        last_step = step == args.num_iterations
 
         # effective-batch curriculum. the shape is fixed, so fewer accumulation steps
         # means a cheaper iteration carrying proportionally fewer tokens: the model
         # sees full context throughout and only the update frequency changes.
-        prev_grad_accum, curr_grad_accum = curr_grad_accum, grad_accum_at(grad_accum_stages, step / lr_horizon)
+        prev_grad_accum, curr_grad_accum = curr_grad_accum, grad_accum_at(grad_accum_stages, step / args.num_iterations)
         if curr_grad_accum != prev_grad_accum:
-            print0(f"step:{step}/{lr_horizon} | grad accum -> {curr_grad_accum} | tokens/iter {tokens_per_iter_at(curr_grad_accum):,}")
+            print0(f"step:{step}/{args.num_iterations} | grad accum -> {curr_grad_accum} | tokens/iter {tokens_per_iter_at(curr_grad_accum):,}")
 
         # once in a while evaluate the validation dataset
-        if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or step == args.num_iterations or last_step):
+        if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step):
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
@@ -836,7 +806,7 @@ if __name__ == "__main__":
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
                 val_loss /= val_steps
             # log to console and to file
-            print0(f"step:{step}/{lr_horizon} | val loss {val_loss:.6f}")
+            print0(f"step:{step}/{args.num_iterations} | val loss {val_loss:.6f}")
             if master_process:
                 if args.log_wandb:
                     wandb.log({"val_loss": val_loss}, step=total_tokens)
@@ -849,15 +819,6 @@ if __name__ == "__main__":
             # restart the clock
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-
-            # every rank computes val_loss identically (all_reduce above), so this branches the same way everywhere
-            if args.extend_training and step >= args.num_iterations and val_loss <= args.target_val_loss:
-                print0(f"converged: val loss {val_loss:.6f} <= target {args.target_val_loss:.6f} at step {step}/{lr_horizon}")
-                last_step = True
-            elif args.extend_training and step == args.num_iterations and val_loss > args.target_val_loss:
-                print0(
-                    f"val loss {val_loss:.6f} > target {args.target_val_loss:.6f} at step {step}/{args.num_iterations}; extending training up to {args.max_iterations} iterations"
-                )
 
         # bit confusing: we want to make sure to eval on 0th iteration
         # but also after the very last iteration. so we loop for step <= num_iterations
@@ -904,7 +865,7 @@ if __name__ == "__main__":
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
         lossf = train_loss.item()  # keep track of the mean loss
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f"step:{step}/{lr_horizon} | loss {lossf:.6f} | train_time:{approx_training_time_ms / 1000:.2f}s | step_avg:{approx_training_time_ms / (step + 1):.2f}ms")
+        print0(f"step:{step}/{args.num_iterations} | loss {lossf:.6f} | train_time:{approx_training_time_ms / 1000:.2f}s | step_avg:{approx_training_time_ms / (step + 1):.2f}ms")
         # log to logile
         if master_process and logfile is not None:
             with open(logfile, "a") as f:
