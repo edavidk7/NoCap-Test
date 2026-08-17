@@ -43,7 +43,7 @@ Prototype your idea on a subset of the **FineWeb** dataset using **1 GPU**.
 **(Optional) goal:** reach a validation loss of **≤ 3.3821** faster than the baseline.
 
 You can achieve this by:
-- making your model faster (so that it sees more data in shorter time)
+- making your model faster (so that it sees more data in so shorter time)
 - making your training more efficient (so that in less steps your model makes better progress).
 
 ---

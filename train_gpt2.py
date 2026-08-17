@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch._inductor import config
 from torch.distributed import destroy_process_group, init_process_group
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 torch.set_float32_matmul_precision('high')
@@ -28,23 +29,24 @@ with open(sys.argv[0]) as f:
 
 
 class Rotary(torch.nn.Module):
-    def __init__(self, dim, base=10000):
+    def __init__(self, dim, max_seq_len, base=10000):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-        self.seq_len_cached = None
-        self.cos_cached = None
-        self.sin_cached = None
+        freqs = torch.outer(torch.arange(max_seq_len).type_as(inv_freq), inv_freq)
+        self.register_buffer("cos_cached", freqs.cos().bfloat16(), persistent=False)
+        self.register_buffer("sin_cached", freqs.sin().bfloat16(), persistent=False)
 
     def forward(self, x):
         seq_len = x.shape[1]
-        if seq_len != self.seq_len_cached:
-            self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.outer(t, self.inv_freq).to(x.device)
-            self.cos_cached = freqs.cos()
-            self.sin_cached = freqs.sin()
-        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+        return self.cos_cached[None, :seq_len, None, :], self.sin_cached[None, :seq_len, None, :]
+
+
+def head_window_block_mask(windows, seq_len, device, block_size=None):
+    w = torch.tensor(windows, device=device)
+    def mask_mod(b, h, q_idx, kv_idx):
+        return (q_idx >= kv_idx) & (q_idx - kv_idx < w[h])
+    kw = {"BLOCK_SIZE": block_size} if block_size else {}
+    return create_block_mask(mask_mod, B=None, H=len(windows), Q_LEN=seq_len, KV_LEN=seq_len, device=device, **kw)
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -83,6 +85,14 @@ class CausalSelfAttention(nn.Module):
         if self.learn_temperature:
             self.log_temperature = nn.Parameter(torch.zeros(self.n_head))  # default temperature to 1.0
         self.log_temperature_scale = config.temperature_scale
+        ko = {}
+        if config.attn_kernel_block:
+            kb = config.attn_kernel_block
+            ko.update(BLOCK_M=kb, BLOCK_N=kb)
+        if config.attn_kernel_block_bwd:
+            kb = config.attn_kernel_block_bwd
+            ko.update(BLOCK_M1=kb, BLOCK_N1=kb, BLOCK_M2=kb, BLOCK_N2=kb)
+        self.kernel_options = ko or None
         self.temperature_ones = torch.ones(2 * self.n_embd)
         if self.head_gate:
             self.gate_proj = nn.Linear(self.n_embd, self.n_head)
@@ -97,7 +107,7 @@ class CausalSelfAttention(nn.Module):
         fused_weight = self.c_attn.weight * scaler
         return F.linear(x, fused_weight)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, block_mask=None):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         if self.learn_temperature:
@@ -111,7 +121,11 @@ class CausalSelfAttention(nn.Module):
 
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        if block_mask is not None:
+            y = flex_attention(q.to(v.dtype), k.to(v.dtype), v, block_mask=block_mask, kernel_options=self.kernel_options)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2)  # (B, T, n_head, head_dim)
         if self.head_gate:
             gate = torch.sigmoid(self.gate_proj(x)).view(B, T, self.n_head, 1)
@@ -123,11 +137,14 @@ class CausalSelfAttention(nn.Module):
 
 
 MLP_ACTIVATIONS = {
+    "id": nn.Identity(),
     "gelu": F.gelu,
     "relu": F.relu,
     "silu": F.silu,
     "relu2": lambda x: F.relu(x).square(),
 }
+
+GATED_INIT_GAIN = {"linear": 1.0, "id": 1.0004, "gelu": 1.2226, "relu": 1.1890, "silu": 1.2689, "relu2": 0.9350}
 
 
 def _align64(x: float) -> int:
@@ -138,7 +155,7 @@ def _align64(x: float) -> int:
 class GLUFeedForward(nn.Module):
     """GLU-family FFN"""
 
-    def __init__(self, config, mlp_alpha):
+    def __init__(self, config, mlp_alpha, gain=2.0):
         super().__init__()
         self.act = MLP_ACTIVATIONS[config.mlp_act]
         d_model = config.n_embd
@@ -147,14 +164,34 @@ class GLUFeedForward(nn.Module):
         self.lin = nn.Linear(d_model, 2 * d_ff_gated, bias=False)
         self.out = nn.Linear(d_ff_gated, d_model, bias=False)
         with torch.no_grad():
-            self.lin.weight.normal_(std=math.sqrt(4.0 / d_model))
+            self.lin.weight.normal_(std=gain * math.sqrt(1. / d_model))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y_gate_y_out = self.lin(x)
         y_gate, y_out = y_gate_y_out.chunk(2, dim=-1)
         g_in = y_gate
         gate_act = self.act(g_in)
-        gated_state = rmsnorm(gate_act * y_out)
+        gated_state = gate_act * y_out
+        return self.out(gated_state)
+
+class GLUBottleneck(nn.Module):
+    def __init__(self, in_feats, out_feats, act, mlp_alpha=4.0, gain=2.0):
+        super().__init__()
+        self.act = MLP_ACTIVATIONS[act]
+        d_ff = _align64((2 * mlp_alpha / 3) * in_feats) if mlp_alpha else out_feats
+        print0(f"lm_head GLU bottleneck: {in_feats} -> 2x{d_ff} -> {out_feats}")
+        self.lin = nn.Linear(in_feats, 2 * d_ff, bias=False)
+        self.out = nn.Linear(d_ff, out_feats, bias=False)
+        with torch.no_grad():
+            self.lin.weight.normal_(std=gain * math.sqrt(1. / in_feats))
+            self.out.weight.normal_(std=math.sqrt(1. / d_ff))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y_gate_y_out = self.lin(x)
+        y_gate, y_out = y_gate_y_out.chunk(2, dim=-1)
+        g_in = y_gate
+        gate_act = self.act(g_in)
+        gated_state = gate_act * y_out
         return self.out(gated_state)
 
 
@@ -182,9 +219,10 @@ class Block(nn.Module):
         self.no_ffn = no_ffn
         if not self.no_ffn:
             self.mlp = {"mlp": MLP, "glu": GLUFeedForward}[config.ff_kind](config, mlp_alpha)
+        print(f"Transformer Block {"Disabled FFN, " if self.no_ffn else ""} Alpha {mlp_alpha}")
 
-    def forward(self, x, cos, sin):
-        x = x + self.attn_scale * self.attn(rmsnorm(x), cos, sin)
+    def forward(self, x, cos, sin, block_mask=None):
+        x = x + self.attn_scale * self.attn(rmsnorm(x), cos, sin, block_mask)
         if not self.no_ffn:
             x = x + self.mlp(rmsnorm(x))
         else:
@@ -210,10 +248,19 @@ class GPTConfig:
     mlp_alpha: float | int | list[float | int] = 4.0  # MLP/GLU hidden-dim multiplier, scalar or per-block list
     head_gate: bool = False
     mlp_drop_n: int = 1  # drop every N-1 mlps, keeping the first one.
+    max_seq_len: int = 1024  # longest sequence the run will see: max(training T, VAL_SEQ_LEN_MAX)
+    attn_head_windows: str | list[str] = ""  # per-head spans, e.g. "0:32,1:64"; one spec per block, last repeats
+    attn_block_size: int = 0  # flex mask block granularity; 0 keeps the 128 default
+    attn_kernel_block: int = 0  # flex forward Triton tile (BLOCK_M/BLOCK_N); 0 lets the autotuner choose
+    attn_kernel_block_bwd: int = 0  # flex backward tiles (BLOCK_M1/N1/M2/N2); needed for a sub-128 mask block
+    lm_head_bottleneck: int | None = None  # factorise the tied embedding through this dim; None keeps V x n_embd
+    lm_bottleneck_act: str = "gelu"  # gate activation of the output GLU; "id" makes it bilinear
+    lm_bottleneck_alpha: float = 4.0  # output GLU hidden width as 2/3*alpha*n_embd; 0 pins it to d_b
+    emb_aux_lambda: float = 0.0  # aux loss pulling h toward E[y_true] (detached); 0 disables
 
 
 class GPT(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
 
@@ -226,44 +273,90 @@ class GPT(nn.Module):
 
         blocks = []
         for i in range(0, config.n_layer, config.mlp_drop_n):
-            blocks.append(Block(config, mlp_alphas[i], no_ffn=False))
+            blocks.append(Block(config, mlp_alphas[i], no_ffn=False or mlp_alphas[i] == 0))
             for j in range(1, config.mlp_drop_n):
-                print(f"Transformer Block {i + j} disabled FF network")
                 blocks.append(Block(config, mlp_alphas[i + j], no_ffn=True))
 
+        db = config.lm_head_bottleneck
+        self.bottleneck = db
+        head_dim = db if db else config.n_embd
         self.transformer = nn.ModuleDict(
             dict(
-                wte=nn.Embedding(config.vocab_size, config.n_embd),
+                wte=nn.Embedding(config.vocab_size, head_dim),
                 h=nn.ModuleList(blocks),
             )
         )
-        self.rotary = Rotary(config.n_embd // config.n_head)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.rotary = Rotary(config.n_embd // config.n_head, config.max_seq_len)
+        self.block_masks = {}  # seq_len -> flex BlockMask, the work-skipping alternative
+        if db:
+            act = config.lm_bottleneck_act
+            self.in_proj = nn.Linear(db, config.n_embd, bias=False)
+            if act == "linear":
+                self.out_proj = nn.Linear(config.n_embd, db, bias=False)
+                with torch.no_grad():
+                    self.out_proj.weight.normal_(std=GATED_INIT_GAIN[act] * math.sqrt(1. / config.n_embd))
+            else:
+                self.out_proj = GLUBottleneck(config.n_embd, db, act, config.lm_bottleneck_alpha, GATED_INIT_GAIN[act])
+        self.lm_head = nn.Linear(head_dim, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
+
+    def build_attn_masks(self, seq_lens, device):
+        """Block masks cannot be built in __init__: they hold tensors and need the device.
+
+        self.block_masks maps seq_len -> one BlockMask per block. Layers sharing a spec share
+        the mask object, so the common case of a single spec builds exactly one mask.
+        """
+        specs = self.config.attn_head_windows
+        if not specs:
+            return
+        if isinstance(specs, str):
+            specs = [specs]
+        specs = per_block_specs(specs, self.config.n_layer)
+        for spec in dict.fromkeys(specs):
+            print0(f"attention spans, blocks {[i for i, s in enumerate(specs) if s == spec]}: "
+                   f"{parse_head_windows(spec, self.config.n_head, self.config.max_seq_len)}")
+        self.block_masks = {}
+        for n in seq_lens:
+            cache = {}
+            for spec in dict.fromkeys(specs):
+                windows = parse_head_windows(spec, self.config.n_head, self.config.max_seq_len)
+                cache[spec] = head_window_block_mask(windows, n, device, self.config.attn_block_size)
+            self.block_masks[n] = [cache[spec] for spec in specs]
+
 
     def forward(self, idx, targets=None, return_logits=True):
         # forward the GPT model itself
-        x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        x = self.transformer.wte(idx)  # token embeddings of shape (b, t, head_dim)
+        if self.bottleneck:
+            x = self.in_proj(x)
         cos, sin = self.rotary(x)
 
-        for block in self.transformer.h:
-            x = block(x, cos, sin)
+        masks = self.block_masks.get(idx.shape[1])
+        for i, block in enumerate(self.transformer.h):
+            x = block(x, cos, sin, masks[i] if masks else None)
         x = rmsnorm(x)
+        if self.bottleneck:
+            x = self.out_proj(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            if self.config.emb_aux_lambda > 0:
+                target_emb = self.transformer.wte(targets).detach()
+                mask = (targets != -1)
+                diff = (x - target_emb) * mask.unsqueeze(-1)
+                aux_loss = (diff * diff).sum() / mask.sum() / x.shape[-1]
+            else:
+                aux_loss = None
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
-            loss = None
+            logits = self.lm_head(x[:, [-1], :])
+            ce_loss = None
+            aux_loss = None
 
-        # there are performance reasons why not returning logits is prudent, if not needed
         if not return_logits:
             logits = None
 
-        return logits, loss
+        return logits, ce_loss, aux_loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, temperature_lr_mult=1.0):
         temperature_params = [p for n, p in self.named_parameters() if n.endswith("log_temperature")]
@@ -272,7 +365,6 @@ class GPT(nn.Module):
             {"params": other_params, "lr_scale": 1.0},
             {"params": temperature_params, "lr_scale": temperature_lr_mult, "weight_decay": 0.0, "is_temperature": True},
         ]
-        # fused AdamW is a single CUDA kernel per step instead of one per tensor
         optimizer = torch.optim.AdamW(param_groups, lr=learning_rate, weight_decay=weight_decay, betas=betas, fused=device_type.startswith("cuda"))
         return optimizer
 
@@ -299,16 +391,12 @@ def _peek_data_shard(filename):
 
 def _load_data_shard(filename):
     with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
         header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
         assert header[0] == 20240520, "magic number mismatch in the data .bin file"
         assert header[1] == 1, "unsupported version"
         ntok = header[2]  # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
         tokens = np.frombuffer(f.read(), dtype=np.uint16)
     assert len(tokens) == ntok, "number of tokens read does not match header?"
-    # cast the whole shard to the dtype the model expects once here, so that
-    # next_batch() only has to slice/view (no re-casting per batch)
     return torch.from_numpy(tokens.astype(np.int64))
 
 
@@ -415,8 +503,6 @@ def print0(*args, **kwargs):
 
 def parse_grad_accum_schedule(spec, default_steps):
     """"0:1,0.5:4,0.9:16" -> [(0.0, 1), (0.5, 4), (0.9, 16)].
-
-    Fractions are of the run length. An empty spec means a constant default_steps.
     """
     if not spec:
         return [(0.0, default_steps)]
@@ -427,10 +513,55 @@ def parse_grad_accum_schedule(spec, default_steps):
     return stages
 
 
+def per_block_specs(specs, n_layer):
+    """One span spec per block, repeating the last entry to fill out the depth.
+
+    ["0:64", "0:128"] with 12 blocks -> block 0 gets "0:64" and blocks 1-11 get "0:128".
+    """
+    assert len(specs) <= n_layer, f"got {len(specs)} span specs for {n_layer} blocks"
+    return list(specs) + [specs[-1]] * (n_layer - len(specs))
+
+
+def parse_head_windows(spec, n_head, full):
+    """"0:32,1:64" -> [32, 64, full, full, ...], one attention span per head.
+    """
+    windows = [full] * n_head
+    for entry in spec.split(","):
+        head, span = (int(v) for v in entry.split(":"))
+        assert 0 <= head < n_head, f"head index {head} out of range for {n_head} heads"
+        assert span > 0, f"attention span must be positive, got {span}"
+        windows[head] = span
+    return windows
+
+
 def grad_accum_at(stages, progress):
     """Gradient accumulation steps for a given fraction of training completed."""
     # stages is sorted and starts at 0.0, so this always matches
     return next(steps for frac, steps in reversed(stages) if progress >= frac)
+
+
+class WeightEMA:
+
+    def __init__(self, model, decay):
+        self.decay = decay
+        self.params = [p for p in model.parameters() if p.requires_grad]
+        self.shadow = [p.detach().clone() for p in self.params]
+        self.backup = None
+
+    @torch.no_grad()
+    def update(self, step):
+        decay = min(self.decay, step / (step + 1))
+        torch._foreach_lerp_(self.shadow, self.params, 1.0 - decay)
+
+    @torch.no_grad()
+    def swap_in(self):
+        self.backup = [p.detach().clone() for p in self.params]
+        torch._foreach_copy_(self.params, self.shadow)
+
+    @torch.no_grad()
+    def swap_out(self):
+        torch._foreach_copy_(self.params, self.backup)
+        self.backup = None
 
 
 def inspect_model_to_log(model: GPT) -> dict:
@@ -518,6 +649,12 @@ if __name__ == "__main__":
         help="learning rate warmdown iterations",
     )
     parser.add_argument(
+        "--lr_final_frac",
+        type=float,
+        default=0.0,
+        help="fraction of peak LR the warmdown decays to; 0.0 anneals to zero as before",
+    )
+    parser.add_argument(
         "--learn_temperature",
         action="store_true",
         default=False,
@@ -547,7 +684,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--mlp_drop_n", type=int, default=1, help="share MLP weights every N consecutive blocks (n_layer must be divisible by N)")
     parser.add_argument("--head_gate", action="store_true", default=False, help="enable learned per-head output gating in attention")
+    parser.add_argument("--attn_head_windows", type=str, nargs="+", default=[], help='per-head attention spans as "head:span" pairs, e.g. "0:32,1:64"; heads not named keep full context. Pass one spec per transformer block to vary spans with depth -- the last spec repeats to fill the remaining blocks, so a single spec applies everywhere')
+    parser.add_argument("--attn_block_size", type=int, default=0, help="flex mask block granularity; must divide the kernel tile. 0 keeps the 128 default")
+    parser.add_argument("--attn_kernel_block", type=int, default=0, help="flex forward Triton tile (BLOCK_M/BLOCK_N); 0 lets the autotuner choose")
+    parser.add_argument("--lm_bottleneck_act", type=str, choices=["linear"] + list(MLP_ACTIVATIONS), default="gelu", help='how the bottleneck maps n_embd back down to d_b. "linear" is a plain projection with no gating (the simplest baseline), "id" is a bilinear a*b, and gelu/silu/relu/relu2 gate one half by that activation. Init is rescaled per choice so the initial logit scale matches the unfactorised head')
+    parser.add_argument("--lm_bottleneck_alpha", type=float, default=4.0, help="hidden width of the output GLU as 2/3*alpha*n_embd, matching the FFN convention of scaling with the width the layer reads. 0 pins the hidden width to d_b instead (non-expanding)")
+    parser.add_argument("--lm_head_bottleneck", type=int, default=None, help="factorise the tied embedding through this dimension (e.g. 384): V x d_b table, a d_b->n_embd input projection, and an n_embd->d_b output GeGLU. Unset keeps the full V x n_embd head")
+    parser.add_argument("--emb_aux_lambda", type=float, nargs="+", default=[0.0], help="aux loss coefficient: 1 value (constant) or 3 values (warmup, high-lr, warmdown)")
+    parser.add_argument("--attn_kernel_block_bwd", type=int, default=0, help="flex backward Triton tiles (BLOCK_M1/N1/M2/N2); a sub-128 mask block must divide these too")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
+    parser.add_argument("--ema_decay", type=float, nargs="+", default=[0.0], help="EMA decay(s) for averaged copies of the weights, each evaluated alongside the raw ones (0 disables). Several may be given: EMA is a passive observer, so one run can compare horizons")
     # evaluation
     parser.add_argument(
         "--val_loss_every",
@@ -633,9 +779,7 @@ if __name__ == "__main__":
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
     x, y = train_loader.next_batch()
 
-    # validation is pinned at VAL_SEQ_LEN_MAX so the score stays comparable when
-    # training runs longer than the scored length
-    val_T = min(T, VAL_SEQ_LEN_MAX)
+    val_T = VAL_SEQ_LEN_MAX
     tokens_per_iter_val = args.val_batch_size * val_T * ddp_world_size
     assert VAL_TOKENS % tokens_per_iter_val == 0
     val_steps = VAL_TOKENS // tokens_per_iter_val
@@ -656,6 +800,15 @@ if __name__ == "__main__":
             mlp_alpha=mlp_alpha,
             head_gate=args.head_gate,
             mlp_drop_n=args.mlp_drop_n,
+            max_seq_len=max(T, VAL_SEQ_LEN_MAX),
+            attn_head_windows=args.attn_head_windows,
+            attn_block_size=args.attn_block_size,
+            attn_kernel_block=args.attn_kernel_block,
+            attn_kernel_block_bwd=args.attn_kernel_block_bwd,
+            lm_head_bottleneck=args.lm_head_bottleneck,
+            lm_bottleneck_act=args.lm_bottleneck_act,
+            lm_bottleneck_alpha=args.lm_bottleneck_alpha,
+            emb_aux_lambda=args.emb_aux_lambda[0],
         ),  # 124M GPT-2
         "d24": GPTConfig(
             vocab_size=num_vocab,
@@ -669,6 +822,15 @@ if __name__ == "__main__":
             mlp_alpha=mlp_alpha,
             head_gate=args.head_gate,
             mlp_drop_n=args.mlp_drop_n,
+            max_seq_len=max(T, VAL_SEQ_LEN_MAX),
+            attn_head_windows=args.attn_head_windows,
+            attn_block_size=args.attn_block_size,
+            attn_kernel_block=args.attn_kernel_block,
+            attn_kernel_block_bwd=args.attn_kernel_block_bwd,
+            lm_head_bottleneck=args.lm_head_bottleneck,
+            lm_bottleneck_act=args.lm_bottleneck_act,
+            lm_bottleneck_alpha=args.lm_bottleneck_alpha,
+            emb_aux_lambda=args.emb_aux_lambda[0],
         ),
         "d36": GPTConfig(
             vocab_size=num_vocab,
@@ -682,6 +844,15 @@ if __name__ == "__main__":
             mlp_alpha=mlp_alpha,
             head_gate=args.head_gate,
             mlp_drop_n=args.mlp_drop_n,
+            max_seq_len=max(T, VAL_SEQ_LEN_MAX),
+            attn_head_windows=args.attn_head_windows,
+            attn_block_size=args.attn_block_size,
+            attn_kernel_block=args.attn_kernel_block,
+            attn_kernel_block_bwd=args.attn_kernel_block_bwd,
+            lm_head_bottleneck=args.lm_head_bottleneck,
+            lm_bottleneck_act=args.lm_bottleneck_act,
+            lm_bottleneck_alpha=args.lm_bottleneck_alpha,
+            emb_aux_lambda=args.emb_aux_lambda[0],
         ),
         "d48": GPTConfig(
             vocab_size=num_vocab,
@@ -695,6 +866,15 @@ if __name__ == "__main__":
             mlp_alpha=mlp_alpha,
             head_gate=args.head_gate,
             mlp_drop_n=args.mlp_drop_n,
+            max_seq_len=max(T, VAL_SEQ_LEN_MAX),
+            attn_head_windows=args.attn_head_windows,
+            attn_block_size=args.attn_block_size,
+            attn_kernel_block=args.attn_kernel_block,
+            attn_kernel_block_bwd=args.attn_kernel_block_bwd,
+            lm_head_bottleneck=args.lm_head_bottleneck,
+            lm_bottleneck_act=args.lm_bottleneck_act,
+            lm_bottleneck_alpha=args.lm_bottleneck_alpha,
+            emb_aux_lambda=args.emb_aux_lambda[0],
         ),
         "d36": GPTConfig(
             vocab_size=num_vocab,
@@ -708,6 +888,15 @@ if __name__ == "__main__":
             mlp_alpha=mlp_alpha,
             head_gate=args.head_gate,
             mlp_drop_n=args.mlp_drop_n,
+            max_seq_len=max(T, VAL_SEQ_LEN_MAX),
+            attn_head_windows=args.attn_head_windows,
+            attn_block_size=args.attn_block_size,
+            attn_kernel_block=args.attn_kernel_block,
+            attn_kernel_block_bwd=args.attn_kernel_block_bwd,
+            lm_head_bottleneck=args.lm_head_bottleneck,
+            lm_bottleneck_act=args.lm_bottleneck_act,
+            lm_bottleneck_alpha=args.lm_bottleneck_alpha,
+            emb_aux_lambda=args.emb_aux_lambda[0],
         ),
         "d48": GPTConfig(
             vocab_size=num_vocab,
@@ -721,10 +910,20 @@ if __name__ == "__main__":
             mlp_alpha=mlp_alpha,
             head_gate=args.head_gate,
             mlp_drop_n=args.mlp_drop_n,
+            max_seq_len=max(T, VAL_SEQ_LEN_MAX),
+            attn_head_windows=args.attn_head_windows,
+            attn_block_size=args.attn_block_size,
+            attn_kernel_block=args.attn_kernel_block,
+            attn_kernel_block_bwd=args.attn_kernel_block_bwd,
+            lm_head_bottleneck=args.lm_head_bottleneck,
+            lm_bottleneck_act=args.lm_bottleneck_act,
+            lm_bottleneck_alpha=args.lm_bottleneck_alpha,
+            emb_aux_lambda=args.emb_aux_lambda[0],
         ),
     }[args.model]
     model = GPT(model_config)
     model = model.train().cuda()
+    model.build_attn_masks({T, VAL_SEQ_LEN_MAX}, device)
     if hasattr(config, "coordinate_descent_tuning"):
         config.coordinate_descent_tuning = True  # suggested by @Chillee
     if ddp_world_size == 1:
@@ -733,8 +932,6 @@ if __name__ == "__main__":
     model = torch.compile(model, dynamic=False)  # NOTE: this might cause issues depending on your GPU, consider turning it off
 
     # here we wrap model into DDP container
-    # broadcast_buffers=False: the only buffer (Rotary.inv_freq) is static and
-    # identical across ranks by construction, so there's nothing to re-sync
     model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=False)
     raw_model = model.module  # always contains the "raw" unwrapped model
 
@@ -756,10 +953,31 @@ if __name__ == "__main__":
         # 2) constant lr for a while
         elif it < args.num_iterations - args.warmdown_iters:
             return args.learning_rate
-        # 3) linear warmdown
         else:
             decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-            return args.learning_rate * decay_ratio
+            return args.learning_rate * (args.lr_final_frac + (1 - args.lr_final_frac) * decay_ratio)
+
+    # aux lambda schedule: 1 value = constant, 2 values = linear(start, end), 3 = (warmup, high-lr, warmdown)
+    aux_lambdas = args.emb_aux_lambda
+    assert len(aux_lambdas) in (1, 2, 3), "--emb_aux_lambda needs 1, 2, or 3 values"
+    def get_aux_lambda(it):
+        if len(aux_lambdas) == 1:
+            return aux_lambdas[0]
+        elif len(aux_lambdas) == 2:
+            t = it / max(args.num_iterations - 1, 1)
+            return aux_lambdas[0] + (aux_lambdas[1] - aux_lambdas[0]) * t
+        else:
+            if it < args.warmup_iters:
+                return aux_lambdas[0]
+            elif it < args.num_iterations - args.warmdown_iters:
+                return aux_lambdas[1]
+            else:
+                return aux_lambdas[2]
+
+    emas = {f"ema{d}": WeightEMA(raw_model, d) for d in sorted(args.ema_decay) if d > 0}
+    for d in sorted(args.ema_decay):
+        if d > 0:
+            print0(f"weight EMA enabled, decay {d} (horizon ~{1 / (1 - d):.0f} steps)")
 
     run_id = str(uuid.uuid4())
 
@@ -796,25 +1014,41 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
             model.eval()
-            val_loader.reset()  # reset the val loader so that it starts from the beginning
-            with torch.no_grad():
-                val_loss = 0.0
-                for _ in range(val_steps):
-                    x_val, y_val = val_loader.next_batch()
-                    _, loss = model(x_val, y_val, return_logits=False)
-                    val_loss += loss
-                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-                val_loss /= val_steps
+
+            def evaluate():
+                val_loader.reset()  # reset the val loader so that it starts from the beginning
+                with torch.no_grad():
+                    val_loss = 0.0
+                    for _ in range(val_steps):
+                        x_val, y_val = val_loader.next_batch()
+                        _, ce, _ = model(x_val, y_val, return_logits=False)
+                        val_loss += ce
+                    dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+                    return val_loss / val_steps
+
+            val_loss = evaluate()
+            # the averaged weights get the same eval on the same data, by swapping them
+            # into place and back out again
+            ema_val_losses = {}
+            for d, ema in emas.items():
+                ema.swap_in()
+                ema_val_losses[d] = evaluate()
+                ema.swap_out()
             # log to console and to file
-            print0(f"step:{step}/{args.num_iterations} | val loss {val_loss:.6f}")
+            ema_note = "".join(f" | {d} {v:.6f}" for d, v in ema_val_losses.items())
+            print0(f"step:{step}/{args.num_iterations} | val loss {val_loss:.6f}{ema_note}")
             if master_process:
                 if args.log_wandb:
                     wandb.log({"val_loss": val_loss}, step=total_tokens)
+                    for d, v in ema_val_losses.items():
+                        wandb.log({f"val_loss_{d}": v}, step=total_tokens)
                     wandb.log({"time": training_time_ms}, step=total_tokens)
                     wandb.log(inspect_model_to_log(model.module), step=total_tokens)
                 if logfile is not None:
                     with open(logfile, "a") as f:
                         f.write("s:%d val:%f\n" % (step, val_loss))
+                        for d, v in ema_val_losses.items():
+                            f.write("s:%d %s_val:%f\n" % (step, d, v))
 
             # restart the clock
             torch.cuda.synchronize()
@@ -834,9 +1068,12 @@ if __name__ == "__main__":
             model.require_backward_grad_sync = micro_step == curr_grad_accum - 1  # sync only on last micro step to avoid overhead
             # forward pass
             with ctx:
-                _, loss = model(x, y, return_logits=False)
-                loss = loss / curr_grad_accum  # scale loss for gradient accumulation
-                train_loss += loss.detach()
+                _, ce_loss, aux_loss = model(x, y, return_logits=False)
+                loss = ce_loss
+                if aux_loss is not None:
+                    loss = loss + get_aux_lambda(step) * aux_loss
+                loss = loss / curr_grad_accum
+                train_loss += ce_loss.detach() / curr_grad_accum
             # advance the dataset for the next batch
             x, y = train_loader.next_batch()
             # backward pass
@@ -852,16 +1089,12 @@ if __name__ == "__main__":
         # step the optimizer
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        for ema in emas.values():
+            ema.update(step)
         total_tokens += tokens_per_iter_at(curr_grad_accum)
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
 
-        # time and print
-        # no separate torch.cuda.synchronize() here: train_loss.item() below
-        # already blocks until this step's GPU work (and the all_reduce) is
-        # done, so a dedicated sync first would just be a redundant device drain
-        # the 0th iteration is often an outlier (much slower) => skip logging it
-        # tokens_per_second = ddp_world_size * B * T / (t1-t0)
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
         lossf = train_loss.item()  # keep track of the mean loss
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
@@ -887,8 +1120,6 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------------
     # clean up nice
-    # join the prefetch workers first: a daemon thread still inside pin_memory()
-    # when the interpreter tears down aborts the process (SIGABRT) on exit
     train_loader._stop_prefetch()
     val_loader._stop_prefetch()
     destroy_process_group()
