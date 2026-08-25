@@ -1,3 +1,4 @@
+import argparse
 import glob
 import math
 import os
@@ -245,18 +246,18 @@ class GPTConfig:
     ff_dropout: float = 0.0
     ff_kind: Literal["glu", "mlp"] = "mlp"
     mlp_act: Literal["gelu", "relu", "silu", "relu2"] = "gelu"
-    mlp_alpha: float | int | list[float | int] = 4.0  # MLP/GLU hidden-dim multiplier, scalar or per-block list
+    mlp_alpha: float | int | list[float | int] = 4.0 
     head_gate: bool = False
-    mlp_drop_n: int = 1  # drop every N-1 mlps, keeping the first one.
-    max_seq_len: int = 1024  # longest sequence the run will see: max(training T, VAL_SEQ_LEN_MAX)
-    attn_head_windows: str | list[str] = ""  # per-head spans, e.g. "0:32,1:64"; one spec per block, last repeats
-    attn_block_size: int = 0  # flex mask block granularity; 0 keeps the 128 default
-    attn_kernel_block: int = 0  # flex forward Triton tile (BLOCK_M/BLOCK_N); 0 lets the autotuner choose
-    attn_kernel_block_bwd: int = 0  # flex backward tiles (BLOCK_M1/N1/M2/N2); needed for a sub-128 mask block
-    lm_head_bottleneck: int | None = None  # factorise the tied embedding through this dim; None keeps V x n_embd
-    lm_bottleneck_act: str = "gelu"  # gate activation of the output GLU; "id" makes it bilinear
-    lm_bottleneck_alpha: float = 4.0  # output GLU hidden width as 2/3*alpha*n_embd; 0 pins it to d_b
-    emb_aux_lambda: float = 0.0  # aux loss pulling h toward E[y_true] (detached); 0 disables
+    mlp_drop_n: int = 1 
+    max_seq_len: int = 1024  
+    attn_head_windows: str | list[str] = "" 
+    attn_block_size: int = 0 
+    attn_kernel_block: int = 0  
+    attn_kernel_block_bwd: int = 0  
+    lm_head_bottleneck: int | None = None 
+    lm_bottleneck_act: str = "gelu"
+    lm_bottleneck_alpha: float = 4.0 
+    emb_aux_lambda: float = 0.0  
 
 
 class GPT(nn.Module):
@@ -447,8 +448,6 @@ class DistributedDataLoader:
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
-        # pin here (in the background thread) so the later .cuda(non_blocking=True)
-        # transfer in next_batch() is actually asynchronous
         return x.pin_memory(), y.pin_memory()
 
     def _prefetch_worker(self):
@@ -471,7 +470,6 @@ class DistributedDataLoader:
         if getattr(self, "_thread", None) is None:
             return
         self._stop_event.set()
-        # drain the queue in case the worker is blocked on a full put()
         try:
             while True:
                 self._queue.get_nowait()
@@ -489,8 +487,6 @@ class DistributedDataLoader:
 # int main
 
 VAL_TOKENS = 1_048_576  # how many tokens of validation data. It's important to keep this fixed for consistent comparisons
-# validation never runs longer than this, whatever the training curriculum does:
-# it is the length the run is scored at, so it has to stay comparable
 VAL_SEQ_LEN_MAX = 1024
 
 
@@ -578,12 +574,7 @@ def inspect_model_to_log(model: GPT) -> dict:
     return log
 
 
-if __name__ == "__main__":
-    import argparse
-    import time
-
-    print0(f"Running pytorch {torch.version.__version__}")
-
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     # file system input / output
     parser.add_argument(
@@ -719,73 +710,12 @@ if __name__ == "__main__":
         help="log to wandb",
     )
     parser.add_argument("--seed", type=int, default=None, help="random seed for reproducibility")
-    args = parser.parse_args()
+    return parser
 
-    if args.seed is not None:
-        import random
 
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        torch.cuda.manual_seed_all(args.seed)
-
-    # args error checking and convenience variables
-    # the sequence length is constant now: the curriculum acts on the effective batch
-    B, T = args.batch_size, args.sequence_length
-    assert args.model in {"d12", "d24", "d36", "d48"}
-    # set up DDP (distributed data parallel). torchrun sets this env variable
-    # use of DDP atm demands CUDA, we set the device appropriately according to rank
-    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    init_process_group(backend="nccl")
-    ddp_rank = int(os.environ["RANK"])
-    ddp_local_rank = int(os.environ["LOCAL_RANK"])
-    ddp_world_size = int(os.environ["WORLD_SIZE"])
-    grad_accum_stages = parse_grad_accum_schedule(args.grad_accum_schedule, args.grad_accumulation_steps)
-    for _, steps in grad_accum_stages:
-        assert steps % ddp_world_size == 0, "every scheduled grad accumulation value must be divisible by world size"
-    grad_accum_stages = [(frac, steps // ddp_world_size) for frac, steps in grad_accum_stages]  # each gpu does its fraction
-    print0(f"Using grad accumulation stages {grad_accum_stages}")
-    device = f"cuda:{ddp_local_rank}"
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
-    seed_offset = 0  # each process gets the exact same seed
-    print(f"using device: {device}")
-
-    if args.log_wandb and master_process:
-        import datetime
-
-        import wandb
-
-        start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        wandb.init(project="benchmark_gpt2", name=f"gpt2-{args.model} {start_time}")
-        wandb.config.update(args)
-        wandb.save("train_gpt2.py")
-        wandb.save("run.sh")
-
-    # the shape is fixed, so an iteration is worth fewer tokens when it accumulates
-    # over fewer micro-batches
-    def tokens_per_iter_at(grad_accum):
-        return B * T * ddp_world_size * grad_accum
-
-    planned_tokens = sum(tokens_per_iter_at(grad_accum_at(grad_accum_stages, s / args.num_iterations)) for s in range(args.num_iterations))
-    print0(f"total tokens over the run: {planned_tokens:,}")
-
+def build_model_config(args) -> "GPTConfig":
+    T = args.sequence_length
     mlp_alpha = args.mlp_alpha[0] if len(args.mlp_alpha) == 1 else args.mlp_alpha
-
-    # set up a context manager following the desired dtype and device
-    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-
-    # load tokens
-    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-    x, y = train_loader.next_batch()
-
-    val_T = VAL_SEQ_LEN_MAX
-    tokens_per_iter_val = args.val_batch_size * val_T * ddp_world_size
-    assert VAL_TOKENS % tokens_per_iter_val == 0
-    val_steps = VAL_TOKENS // tokens_per_iter_val
-    val_loader = DistributedDataLoader(args.input_val_bin, args.val_batch_size, val_T, ddp_rank, ddp_world_size)
-
-    # init the model from scratch
     num_vocab = 50257
     model_config = {
         "d12": GPTConfig(
@@ -876,51 +806,81 @@ if __name__ == "__main__":
             lm_bottleneck_alpha=args.lm_bottleneck_alpha,
             emb_aux_lambda=args.emb_aux_lambda[0],
         ),
-        "d36": GPTConfig(
-            vocab_size=num_vocab,
-            n_layer=36,
-            n_head=20,
-            n_embd=1280,
-            learn_temperature=args.learn_temperature,
-            temperature_scale=args.temperature_scale,
-            ff_kind=args.ff_kind,
-            mlp_act=args.mlp_act,
-            mlp_alpha=mlp_alpha,
-            head_gate=args.head_gate,
-            mlp_drop_n=args.mlp_drop_n,
-            max_seq_len=max(T, VAL_SEQ_LEN_MAX),
-            attn_head_windows=args.attn_head_windows,
-            attn_block_size=args.attn_block_size,
-            attn_kernel_block=args.attn_kernel_block,
-            attn_kernel_block_bwd=args.attn_kernel_block_bwd,
-            lm_head_bottleneck=args.lm_head_bottleneck,
-            lm_bottleneck_act=args.lm_bottleneck_act,
-            lm_bottleneck_alpha=args.lm_bottleneck_alpha,
-            emb_aux_lambda=args.emb_aux_lambda[0],
-        ),
-        "d48": GPTConfig(
-            vocab_size=num_vocab,
-            n_layer=48,
-            n_head=25,
-            n_embd=1600,
-            learn_temperature=args.learn_temperature,
-            temperature_scale=args.temperature_scale,
-            ff_kind=args.ff_kind,
-            mlp_act=args.mlp_act,
-            mlp_alpha=mlp_alpha,
-            head_gate=args.head_gate,
-            mlp_drop_n=args.mlp_drop_n,
-            max_seq_len=max(T, VAL_SEQ_LEN_MAX),
-            attn_head_windows=args.attn_head_windows,
-            attn_block_size=args.attn_block_size,
-            attn_kernel_block=args.attn_kernel_block,
-            attn_kernel_block_bwd=args.attn_kernel_block_bwd,
-            lm_head_bottleneck=args.lm_head_bottleneck,
-            lm_bottleneck_act=args.lm_bottleneck_act,
-            lm_bottleneck_alpha=args.lm_bottleneck_alpha,
-            emb_aux_lambda=args.emb_aux_lambda[0],
-        ),
     }[args.model]
+    return model_config
+
+
+if __name__ == "__main__":
+    import time
+
+    print0(f"Running pytorch {torch.version.__version__}")
+
+    args = build_arg_parser().parse_args()
+
+    if args.seed is not None:
+        import random
+
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+
+    # args error checking and convenience variables
+    # the sequence length is constant now: the curriculum acts on the effective batch
+    B, T = args.batch_size, args.sequence_length
+    assert args.model in {"d12", "d24", "d36", "d48"}
+    # set up DDP (distributed data parallel). torchrun sets this env variable
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    grad_accum_stages = parse_grad_accum_schedule(args.grad_accum_schedule, args.grad_accumulation_steps)
+    for _, steps in grad_accum_stages:
+        assert steps % ddp_world_size == 0, "every scheduled grad accumulation value must be divisible by world size"
+    grad_accum_stages = [(frac, steps // ddp_world_size) for frac, steps in grad_accum_stages]  # each gpu does its fraction
+    print0(f"Using grad accumulation stages {grad_accum_stages}")
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
+    seed_offset = 0  # each process gets the exact same seed
+    print(f"using device: {device}")
+
+    if args.log_wandb and master_process:
+        import datetime
+
+        import wandb
+
+        start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        wandb.init(project="benchmark_gpt2", name=f"gpt2-{args.model} {start_time}")
+        wandb.config.update(args)
+        wandb.save("train_gpt2.py")
+        wandb.save("run.sh")
+
+    # the shape is fixed, so an iteration is worth fewer tokens when it accumulates
+    # over fewer micro-batches
+    def tokens_per_iter_at(grad_accum):
+        return B * T * ddp_world_size * grad_accum
+
+    planned_tokens = sum(tokens_per_iter_at(grad_accum_at(grad_accum_stages, s / args.num_iterations)) for s in range(args.num_iterations))
+    print0(f"total tokens over the run: {planned_tokens:,}")
+
+    # set up a context manager following the desired dtype and device
+    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+    # load tokens
+    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    x, y = train_loader.next_batch()
+
+    val_T = VAL_SEQ_LEN_MAX
+    tokens_per_iter_val = args.val_batch_size * val_T * ddp_world_size
+    assert VAL_TOKENS % tokens_per_iter_val == 0
+    val_steps = VAL_TOKENS // tokens_per_iter_val
+    val_loader = DistributedDataLoader(args.input_val_bin, args.val_batch_size, val_T, ddp_rank, ddp_world_size)
+
+    # init the model from scratch
+    model_config = build_model_config(args)
     model = GPT(model_config)
     model = model.train().cuda()
     model.build_attn_masks({T, VAL_SEQ_LEN_MAX}, device)
@@ -1001,9 +961,6 @@ if __name__ == "__main__":
     for step in range(args.num_iterations + 1):
         last_step = step == args.num_iterations
 
-        # effective-batch curriculum. the shape is fixed, so fewer accumulation steps
-        # means a cheaper iteration carrying proportionally fewer tokens: the model
-        # sees full context throughout and only the update frequency changes.
         prev_grad_accum, curr_grad_accum = curr_grad_accum, grad_accum_at(grad_accum_stages, step / args.num_iterations)
         if curr_grad_accum != prev_grad_accum:
             print0(f"step:{step}/{args.num_iterations} | grad accum -> {curr_grad_accum} | tokens/iter {tokens_per_iter_at(curr_grad_accum):,}")
@@ -1016,7 +973,7 @@ if __name__ == "__main__":
             model.eval()
 
             def evaluate():
-                val_loader.reset()  # reset the val loader so that it starts from the beginning
+                val_loader.reset() 
                 with torch.no_grad():
                     val_loss = 0.0
                     for _ in range(val_steps):
@@ -1027,8 +984,6 @@ if __name__ == "__main__":
                     return val_loss / val_steps
 
             val_loss = evaluate()
-            # the averaged weights get the same eval on the same data, by swapping them
-            # into place and back out again
             ema_val_losses = {}
             for d, ema in emas.items():
                 ema.swap_in()
@@ -1065,7 +1020,7 @@ if __name__ == "__main__":
         model.train()
         train_loss = torch.zeros(1, device=device)
         for micro_step in range(curr_grad_accum):
-            model.require_backward_grad_sync = micro_step == curr_grad_accum - 1  # sync only on last micro step to avoid overhead
+            model.require_backward_grad_sync = micro_step == curr_grad_accum - 1
             # forward pass
             with ctx:
                 _, ce_loss, aux_loss = model(x, y, return_logits=False)

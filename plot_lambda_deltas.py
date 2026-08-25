@@ -1,29 +1,3 @@
-#!/usr/bin/env python3
-"""Plot val loss deltas vs a baseline run.
-
-Usage:
-    python plot_lambda_deltas.py --baseline <log_or_wandb> --runs <log_or_wandb> [<log_or_wandb> ...] \
-        [--labels <label> [<label> ...]] [--metric raw|ema0.98|ema0.97|ema0.96] [--out <path.png>]
-
-Examples:
-    # From log files:
-    python plot_lambda_deltas.py \
-        --baseline pylog124M/3689a2b2-3da6-4568-9c84-e4ce1c713679.log \
-        --runs logs/run_emb_aux.log logs/run_emb_aux_l2_02.log \
-        --labels "λ=0.1" "λ=0.2"
-
-    # From wandb run IDs (fetches via wandb API):
-    python plot_lambda_deltas.py \
-        --baseline wandb:ksicht/benchmark_gpt2/runs/abc123 \
-        --runs wandb:ksicht/benchmark_gpt2/runs/def456 \
-        --labels "λ=0.1"
-
-    # Mix of log files and wandb:
-    python plot_lambda_deltas.py \
-        --baseline pylog124M/3689a2b2.log \
-        --runs wandb:ksicht/benchmark_gpt2/runs/abc123 logs/run_emb_aux.log \
-        --labels "wandb run" "local run"
-"""
 import argparse
 import re
 import sys

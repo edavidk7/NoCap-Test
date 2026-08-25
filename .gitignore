@@ -3,3 +3,8 @@ pylog124M/
 logs/
 wandb/
 __pycache__*
+.venv/
+.venv-linux/
+loss_landscape_results/
+best_run_ckpts/
+.DS_Store
