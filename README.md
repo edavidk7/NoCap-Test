@@ -1,4 +1,4 @@
-# My Submission: ~25% Faster to Target Loss with Identical Hyperparameters
+# Training GPT-2 ~25% Faster to Target Loss with Identical Hyperparameters
 
 Full write-up, including the experiments that didn't work is in a comprehensive report: [`report/NoCapTest-report.pdf`](report/NoCapTest-report.pdf).
 
