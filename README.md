@@ -1,3 +1,35 @@
+# My Submission: ~25% Faster to Target Loss with Identical Hyperparameters
+
+Full write-up, including the experiments that didn't work is in a comprehensive report: [`report/NoCapTest-report.pdf`](report/NoCapTest-report.pdf).
+
+What made it into the final recipe (no other hyperparameters changed):
+
+- **Per-head attention windows** (`flex_attention`): 4 heads per block always attend to only the last 64 tokens, and the other heads get wider windows as depth increases (128/256/512 in the shallow blocks, up to the full 1024-token context deeper in the model). Window sizes are based on the token copy-distance distribution of FineWeb.
+- **Batch-size / grad-accumulation schedule**: physical batch `B=64` instead of 16, better GPU throughput at the same tokens/step. Grad accumulation is ramped `2 → 4` at 57% of training (131k → 262k tokens/step), because noisier gradients early on are good enough. Iteration count is 10566, and warmup/warmdown are scaled proportionally.
+- **Passive weight EMA**: short-horizon EMAs (decays 0.98, 0.97, 0.96) evaluated alongside the raw model at no extra wall-clock cost. EMA 0.98 crossed the target first.
+- **Auxiliary JEPA-like L2 embedding loss**: `λ · MSE(h_out, detach(E[y]))` pulls the final hidden state toward the tied embedding of the target token. `λ = 0.1`.
+
+| Stat | Baseline | Fastest cross |
+| - | - | - |
+| Batch `B` | 16 | 64 |
+| Grad accum | const. 32 | `0:2,0.57:4` |
+| Iterations | 4768 | 10566 |
+| Warmup / warmdown | 256 / 1024 | 571 / 4543 |
+| Attention windows | dense causal | depth-varying cascade |
+| EMA decay(s) | none | **0.98**, 0.97, 0.96 |
+| Aux λ | 0 | 0.1 |
+| Final val loss | 3.379 | 3.378 |
+| Total training time | 149.6 min | 114.4 min |
+| First cross (target 3.3821) | 148.6 min | **111.5 min** |
+| Total tokens processed | 2.500 B | 1.980 B |
+| Tokens to first cross | 2.483 B | 1.928 B |
+| **Training-time speedup vs. baseline** | – | **23.5 %** |
+| **First-cross speedup vs. baseline** | – | **25.0 %** |
+
+All runs used seed 42 on a single RTX 6000 Pro Blackwell, and memory stayed under 32 GB so the recipe also fits on an RTX 5090.
+
+---
+
 # GPT-2 Benchmark
 
 ![logo](img/logo.png)
